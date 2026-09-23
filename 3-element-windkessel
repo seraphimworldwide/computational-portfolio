@@ -1,0 +1,109 @@
+Three-element Windkessel model of arterial pressure.
+Compares a healthy baseline against athlete, atherosclerosis and
+hypertension parameter sets.
+
+Run this either as a script (python windkessel_demo.py) or paste the
+sections into separate Jupyter cells (marked with # %% below).
+"""
+
+# %% 1. Imports
+import numpy as np
+from scipy.integrate import odeint
+import matplotlib.pyplot as plt
+
+# %% 2. Model of the heart's outflow (the "driving" waveform)
+def inflow(t, T=0.8, T_sys=0.3, Q_max=380.0):
+    """
+    Aortic inflow Q(t) in mL/s.
+    Approximates ejection as one half-sine pulse per cardiac cycle:
+    flow during systole (T_sys seconds), zero during diastole.
+    T      = length of one cardiac cycle, s  (0.8 s ~ 75 bpm)
+    T_sys  = duration of systole (ejection), s
+    Q_max  = peak flow rate, mL/s
+    """
+    t_in_cycle = t % T
+    if t_in_cycle < T_sys:
+        return Q_max * np.sin(np.pi * t_in_cycle / T_sys)
+    return 0.0
+
+# %% 3. The governing ODE
+def dPc_dt(Pc, t, R, C, T, T_sys, Q_max):
+    """
+    Rate of change of the capacitor (arterial) pressure Pc.
+    This is the charge/discharge equation of a resistor-capacitor
+    circuit driven by the current source Q(t):
+        C * dPc/dt = Q(t) - Pc/R
+    """
+    Q = inflow(t, T, T_sys, Q_max)
+    return (Q - Pc / R) / C
+
+# %% 4. Solve the model for one parameter set
+def run_windkessel(R, C, Zc, T=0.8, T_sys=0.3, Q_max=380.0,
+                    n_cycles=8, points_per_cycle=400, Pc0=80.0):
+    """
+    R   : peripheral resistance, mmHg*s/mL
+    C   : arterial compliance,   mL/mmHg
+    Zc  : aortic characteristic impedance, mmHg*s/mL
+          (the 'stiff pipe' term that adds a systolic kick right at
+          the moment blood is ejected - this is the 3rd, 'aortic
+          impedance' element beyond the simple 2-element RC model)
+    Returns t, P (aortic pressure) and Q (flow) arrays.
+    """
+    t = np.linspace(0, n_cycles * T, n_cycles * points_per_cycle)
+    Pc = odeint(dPc_dt, Pc0, t, args=(R, C, T, T_sys, Q_max)).flatten()
+    Q = np.array([inflow(ti, T, T_sys, Q_max) for ti in t])
+    P = Pc + Zc * Q          # aortic pressure = capacitor pressure + Zc*flow
+    return t, P, Q
+
+# %% 5. Define the four physiological scenarios
+conditions = {
+    "Healthy":         dict(R=0.95, C=1.60, Zc=0.05),
+    "Athlete":         dict(R=0.80, C=2.20, Zc=0.04),  # ↓R, ↑C
+    "Atherosclerosis": dict(R=0.95, C=0.80, Zc=0.06),  # ↓C only
+    "Hypertension":    dict(R=1.35, C=1.40, Zc=0.05),  # ↑R
+}
+
+results = {label: run_windkessel(**params) for label, params in conditions.items()}
+
+# %% 6. Plot: pressure waveform for the last cardiac cycle, all conditions overlaid
+T = 0.8
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+for label, (t, P, Q) in results.items():
+    mask = t >= (t[-1] - T)          # take the final, steady-state cycle
+    t_cycle = t[mask] - t[mask][0]
+    axes[0].plot(t_cycle, P[mask], label=label, linewidth=2)
+
+axes[0].set_xlabel("Time in cardiac cycle (s)")
+axes[0].set_ylabel("Aortic pressure (mmHg)")
+axes[0].set_title("Simulated aortic pressure waveform")
+axes[0].legend()
+axes[0].grid(alpha=0.3)
+
+# %% 7. Summary bar chart: systolic / diastolic / pulse pressure per condition
+labels, sbp, dbp, pp = [], [], [], []
+for label, (t, P, Q) in results.items():
+    mask = t >= (t[-1] - T)
+    labels.append(label)
+    sbp.append(P[mask].max())
+    dbp.append(P[mask].min())
+    pp.append(P[mask].max() - P[mask].min())
+
+x = np.arange(len(labels))
+axes[1].bar(x - 0.2, sbp, width=0.4, label="Systolic")
+axes[1].bar(x + 0.2, dbp, width=0.4, label="Diastolic")
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(labels, rotation=20)
+axes[1].set_ylabel("Pressure (mmHg)")
+axes[1].set_title("Systolic / diastolic pressure by condition")
+axes[1].legend()
+axes[1].grid(alpha=0.3, axis="y")
+
+plt.tight_layout()
+plt.savefig("windkessel_comparison.png", dpi=150)
+plt.show()
+
+# %% 8. Print numeric summary
+print(f"{'Condition':18s} {'SBP':>6s} {'DBP':>6s} {'PP':>6s}")
+for label, s, d, p in zip(labels, sbp, dbp, pp):
+    print(f"{label:18s} {s:6.1f} {d:6.1f} {p:6.1f}")
