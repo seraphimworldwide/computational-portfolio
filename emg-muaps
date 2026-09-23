@@ -1,0 +1,147 @@
+"""
+Synthetic EMG pipeline: generate -> filter -> detect spikes -> cluster
+motor units by amplitude/width -> visualise recruitment over a fatiguing
+sustained contraction.
+
+Paste sections (marked # %%) into separate Jupyter cells, or run as a script.
+"""
+
+# %% 1. Imports
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import butter, sosfiltfilt, find_peaks, peak_widths
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(42)
+
+# %% 2. Generate a synthetic sustained contraction
+# This stands in for a real recording so you can build and test the
+# pipeline before you have real data. Swap this block out later for
+# `raw, t, fs = load_your_recording()`.
+
+fs = 2000.0            # Hz, typical surface EMG sampling rate
+duration = 10.0         # s, sustained contraction
+t = np.arange(0, duration, 1 / fs)
+n = len(t)
+n_mu = 10                # motor unit pool size
+
+# Size principle: unit 0 = smallest/earliest recruited, unit n-1 = largest/latest.
+# This is the actual physiological ordering (Henneman's size principle) --
+# small, fatigue-resistant units first, large, fast-fatiguing units last.
+size = np.linspace(0, 1, n_mu)
+recruit_time = 0.3 + size * 6.0        # s, when each unit switches on
+base_amp = 0.15 + 0.9 * size           # mV, bigger units -> bigger MUAP
+base_dur = 0.006 + 0.006 * size        # s, bigger units -> slightly broader MUAP
+base_rate = 8 + 6 * (1 - size)         # Hz, smaller units fire faster once recruited
+fatigue_widen = 0.35                   # MUAP duration grows 35% by end of contraction
+                                        # (models slowing conduction velocity with fatigue)
+
+def muap_template(duration_s, amp, fs):
+    """One motor unit action potential: a simple biphasic (Ricker-like) pulse."""
+    n_samp = max(int(duration_s * fs), 5)
+    x = np.linspace(-2, 2, n_samp)
+    wave = (1 - x**2) * np.exp(-x**2 / 2)
+    wave = wave / np.max(np.abs(wave))
+    return amp * wave
+
+signal = np.zeros(n)
+spike_log = []  # ground-truth (time, motor_unit_index) - useful for checking your pipeline
+
+for mu in range(n_mu):
+    if recruit_time[mu] > duration - 0.5:
+        continue
+    ti = recruit_time[mu]
+    while ti < duration:
+        isi = 1.0 / max(base_rate[mu] + rng.normal(0, 1.0), 2.0)  # noisy inter-spike interval
+        ti += isi
+        if ti >= duration:
+            break
+        frac = ti / duration
+        dur_t = base_dur[mu] * (1 + fatigue_widen * frac)   # widens as contraction goes on
+        amp_t = base_amp[mu] * (1 + 0.1 * frac)              # slight amplitude rise
+        wave = muap_template(dur_t, amp_t, fs)
+        idx = int(ti * fs)
+        half = len(wave) // 2
+        lo, hi = idx - half, idx - half + len(wave)
+        if lo >= 0 and hi < n:
+            signal[lo:hi] += wave
+            spike_log.append((ti, mu))
+
+mains_noise = 0.05 * np.sin(2 * np.pi * 50 * t + rng.uniform(0, 2 * np.pi))  # 50Hz interference
+broadband_noise = rng.normal(0, 0.03, n)
+raw = signal + mains_noise + broadband_noise
+
+# %% 3. Butterworth bandpass (20-450 Hz) - the frequency band real EMG lives in
+sos_bandpass = butter(4, [20, 450], btype='bandpass', fs=fs, output='sos')
+bandpassed = sosfiltfilt(sos_bandpass, raw)   # sosfiltfilt = zero-phase, doesn't shift spikes
+
+# %% 4. Notch filter to remove 50Hz mains interference
+sos_notch = butter(2, [48, 52], btype='bandstop', fs=fs, output='sos')
+clean = sosfiltfilt(sos_notch, bandpassed)
+
+# %% 5. Detect individual spikes on the rectified, cleaned signal
+rectified = np.abs(clean)
+threshold = np.percentile(rectified, 90) * 0.5   # adaptive threshold; tune per-recording
+peaks, _ = find_peaks(rectified, height=threshold, distance=int(0.005 * fs))
+
+widths_samples, *_ = peak_widths(rectified, peaks, rel_height=0.5)  # full width at half max
+widths_ms = (widths_samples / fs) * 1000
+amps = rectified[peaks]
+spike_times = t[peaks]
+
+print(f"Detected {len(peaks)} spikes (of {len(spike_log)} true spikes in the simulation)")
+
+# %% 6. K-means clustering on (amplitude, width) -> proxy for distinct motor units
+X = np.column_stack([amps, widths_ms])
+X_scaled = StandardScaler().fit_transform(X)   # scale so amplitude and width contribute equally
+
+k = 4  # start with a guess; see the elbow plot below to justify it
+kmeans = KMeans(n_clusters=k, n_init=10, random_state=0).fit(X_scaled)
+labels = kmeans.labels_
+
+# %% 7. Plots
+fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+# (a) raw vs cleaned signal, first 2 seconds
+window = t < 2.0
+axes[0, 0].plot(t[window], raw[window], alpha=0.5, label="Raw")
+axes[0, 0].plot(t[window], clean[window], label="Filtered", linewidth=1.2)
+axes[0, 0].set_title("Raw vs. filtered EMG (first 2 s)")
+axes[0, 0].set_xlabel("Time (s)")
+axes[0, 0].set_ylabel("Amplitude (mV)")
+axes[0, 0].legend()
+
+# (b) amplitude vs width scatter, coloured by cluster
+scatter = axes[0, 1].scatter(amps, widths_ms, c=labels, cmap="viridis", s=15, alpha=0.7)
+axes[0, 1].set_xlabel("Spike amplitude (mV)")
+axes[0, 1].set_ylabel("Spike width, FWHM (ms)")
+axes[0, 1].set_title(f"K-means clusters (k={k}) by amplitude & width")
+
+# (c) elbow plot to justify choice of k
+inertias = []
+ks = range(1, 8)
+for kk in ks:
+    inertias.append(KMeans(n_clusters=kk, n_init=10, random_state=0).fit(X_scaled).inertia_)
+axes[1, 0].plot(ks, inertias, marker='o')
+axes[1, 0].set_xlabel("Number of clusters (k)")
+axes[1, 0].set_ylabel("Inertia")
+axes[1, 0].set_title("Elbow plot for choosing k")
+
+# (d) recruitment over time: which cluster is firing, across the contraction
+axes[1, 1].scatter(spike_times, labels, c=labels, cmap="viridis", s=15, alpha=0.7)
+axes[1, 1].set_xlabel("Time (s)")
+axes[1, 1].set_ylabel("Cluster (motor-unit group)")
+axes[1, 1].set_title("Recruitment over time (fatigue signature)")
+axes[1, 1].set_yticks(range(k))
+
+plt.tight_layout()
+plt.savefig("emg_pipeline_results.png", dpi=150)
+plt.show()
+
+# %% 8. Quick numeric summary per cluster
+print(f"{'Cluster':>7s} {'n_spikes':>9s} {'mean_amp':>9s} {'mean_width':>11s} {'first_seen(s)':>14s}")
+for c in range(k):
+    mask = labels == c
+    print(f"{c:7d} {mask.sum():9d} {amps[mask].mean():9.3f} {widths_ms[mask].mean():11.2f} "
+          f"{spike_times[mask].min():14.2f}")
